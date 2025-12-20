@@ -1,0 +1,1 @@
+# afk_jump.lua
