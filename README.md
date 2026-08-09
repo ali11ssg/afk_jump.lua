@@ -1,1 +1,1 @@
-# afk_jump.lua
+bottt
