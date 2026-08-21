@@ -4,9 +4,8 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python main.py",
+    "startCommand": "uvicorn main:app --host 0.0.0.0 --port $PORT",
     "restartPolicyType": "ON_FAILURE",
-    "healthcheckPath": "/3ltz-status",
-    "healthcheckTimeout": 100
+    "restartPolicyMaxRetries": 5
   }
 }

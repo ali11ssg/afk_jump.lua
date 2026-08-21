@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
 import os
 import random
@@ -21,7 +22,7 @@ if str(_here) not in sys.path:
 
 import uvicorn
 from fastapi import FastAPI, Request, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 import auto
 import auto_async
@@ -34,20 +35,14 @@ except ImportError:
     psutil = None
     _MEMORY_CHECK = False
 
-# ══════════════════════════════════════════════════════════════
-#  Config
-# ══════════════════════════════════════════════════════════════
-PORT             = int(os.environ.get("CHECKER_PORT", os.environ.get("PORT", "6767")))
-REQUEST_TIMEOUT  = 90
+PORT             = int(os.environ.get("CHECKER_PORT", os.environ.get("PORT", "6777")))
+REQUEST_TIMEOUT  = 120
 MEMORY_LIMIT_PCT = 90
 
 logging.basicConfig(level=logging.INFO, format="%(message)s",
                     handlers=[logging.StreamHandler()])
 _log = logging.getLogger("main")
 
-# ══════════════════════════════════════════════════════════════
-#  Dead-site cache
-# ══════════════════════════════════════════════════════════════
 _PROXY_SIGNS = ("407", "CONNECT tunnel", "libcurl", "Proxy Authentication",
                 "curl: (56)", "curl: (7)")
 
@@ -67,7 +62,6 @@ _dead_sites: dict[str, float] = {}
 _dead_lock   = _threading.Lock()
 _mem_cache: dict = {"val": False, "ts": 0.0}
 
-
 def _mark_dead(site_url: str, error_str: str) -> None:
     if not error_str or any(s in error_str for s in _PROXY_SIGNS):
         return
@@ -77,7 +71,6 @@ def _mark_dead(site_url: str, error_str: str) -> None:
                 _dead_sites[site_url] = time.time() + ttl
             return
 
-
 def _exc_text(exc: BaseException | None) -> str:
     if exc is None:
         return ""
@@ -85,10 +78,6 @@ def _exc_text(exc: BaseException | None) -> str:
         return str(exc.args[0])
     return str(exc) or ""
 
-
-# ══════════════════════════════════════════════════════════════
-#  Result normalization
-# ══════════════════════════════════════════════════════════════
 _APPROVED_KEYWORDS = (
     "3DS_AUTHENTICATION", "3DS_AUTH", "3DS",
     "AUTHENTICATION_REQUIRED", "ACTIONREQUIRED",
@@ -112,7 +101,6 @@ _INFRA_ERROR_KEYWORDS = (
     "INVENTORYRESERVATIONFAILURE", "NO SHOPIFY", "SESSION", "LIBCURL",
 )
 
-
 def normalize_result(status: str, result_str: str) -> tuple[str, str]:
     resp = (result_str or "").strip() or "UNKNOWN"
     up   = resp.upper()
@@ -132,14 +120,9 @@ def normalize_result(status: str, result_str: str) -> tuple[str, str]:
         return "declined", resp
     return "error", resp
 
-
 def normalize_proxy(proxy: str) -> str:
     return auto.normalize_proxy(proxy)
 
-
-# ══════════════════════════════════════════════════════════════
-#  Async card check
-# ══════════════════════════════════════════════════════════════
 async def check_card_async(cc: str, site: str, proxy: str) -> dict:
     proxy_url = ""
     try:
@@ -172,31 +155,83 @@ async def check_card_async(cc: str, site: str, proxy: str) -> dict:
 
     if status in ("charged", "approved", "declined"):
         _log.info("%s|%s", cc, result_str)
+
+    currency   = (getattr(res, "currency", None) or "USD").upper()
+    raw_amount = res.amount or "0"
+    _CURRENCY_SYMBOLS = {
+        "USD": "$", "EUR": "€", "GBP": "£", "CAD": "CA$",
+        "AUD": "A$", "JPY": "¥", "CHF": "CHF ", "SEK": "kr ",
+        "NOK": "kr ", "DKK": "kr ", "NZD": "NZ$", "SGD": "S$",
+        "HKD": "HK$", "MXN": "MX$", "BRL": "R$", "INR": "₹",
+        "KRW": "₩", "AED": "AED ", "SAR": "SAR ", "QAR": "QAR ",
+        "KWD": "KD ", "BHD": "BD ", "OMR": "OMR ", "JOD": "JD ",
+        "TRY": "₺", "PLN": "zł ", "CZK": "Kč ", "HUF": "Ft ",
+        "ZAR": "R ", "MYR": "RM ", "THB": "฿", "IDR": "Rp ",
+        "PHP": "₱", "VND": "₫", "ILS": "₪",
+    }
+    symbol           = _CURRENCY_SYMBOLS.get(currency, currency + " ")
+    formatted_amount = f"{symbol}{raw_amount}" if raw_amount not in ("0", "-", "") else raw_amount
+
     return {
         "status":      status,
         "result":      result_str,
-        "amount":      res.amount or "0",
+        "amount":      formatted_amount,
+        "amount_raw":  raw_amount,
+        "currency":    currency,
         "site":        site,
         "receipt_url": res.receipt_url or "",
         "card":        cc,
     }
 
+_STATS_FILE = "stats.json"
+_stats_lock = _threading.Lock()
 
-# ══════════════════════════════════════════════════════════════
-#  Stats & memory guard
-# ══════════════════════════════════════════════════════════════
-_stats = {
-    "active":   0,
-    "total":    0,
-    "charged":  0,
-    "approved": 0,
-    "declined": 0,
-    "errors":   0,
-    "by":       "3ltz",
-    "started":  time.strftime("%Y-%m-%d %H:%M:%S"),
-}
+def _ts_now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def _load_stats() -> tuple[dict, dict]:
+    """تحميل الإحصاءات من الملف عند بدء التشغيل."""
+    default_stats = {
+        "active": 0, "total": 0,
+        "charged": 0, "approved": 0, "declined": 0, "errors": 0,
+        "by": "a3ltz",
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_charged": None, "last_approved": None, "last_declined": None,
+    }
+    default_counters: dict[str, dict] = {}
+    if not os.path.exists(_STATS_FILE):
+        return default_stats, default_counters
+    try:
+        with open(_STATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        stats    = data.get("stats", default_stats)
+        counters = data.get("counters", default_counters)
+        stats["active"] = 0  # active دائماً يبدأ من صفر عند إعادة التشغيل
+        return stats, counters
+    except Exception:
+        return default_stats, default_counters
 
+def _persist_stats() -> None:
+    """حفظ الإحصاءات في الملف — يُستدعى بعد كل تحديث."""
+    try:
+        with open(_STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"stats": _stats, "counters": _response_counters},
+                      f, ensure_ascii=False)
+    except Exception:
+        pass
+
+_stats, _response_counters = _load_stats()
+
+def _track_response(result_str: str, category: str) -> None:
+    key = (result_str or "UNKNOWN").strip().upper() or "UNKNOWN"
+    cat_map = {"charged":"charged","approved":"approved","declined":"declined",
+               "error":"errors","errors":"errors"}
+    norm_cat = cat_map.get(category, "errors")
+    with _stats_lock:
+        if key not in _response_counters:
+            _response_counters[key] = {"count": 0, "category": norm_cat}
+        _response_counters[key]["count"] += 1
+        _persist_stats()
 
 def _is_memory_exceeded() -> bool:
     if not _MEMORY_CHECK or psutil is None:
@@ -212,10 +247,9 @@ def _is_memory_exceeded() -> bool:
     _mem_cache["ts"]  = now
     return val
 
-
-async def _save_dump(card: str, site: str, status: str, result: str, amount: str):
+async def _save_dump(card: str, site: str, status: str, result: str, amount: str, currency: str = "USD"):
     ts   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {status.upper()} | {card} | {site} | {result} | ${amount}\n"
+    line = f"[{ts}] {status.upper()} | {card} | {site} | {result} | {amount}\n"
     def _write():
         try:
             with open("dump.txt", "a", encoding="utf-8") as f:
@@ -225,24 +259,66 @@ async def _save_dump(card: str, site: str, status: str, result: str, amount: str
             pass
     await asyncio.to_thread(_write)
 
-
-# ══════════════════════════════════════════════════════════════
-#  FastAPI app
-# ══════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="3ltz", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app = FastAPI(title="a3ltz", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
+_INFRA_KEYS = (
+    "STEP ", "FAILED:", "RETURNED 4", "RETURNED 5",
+    "CURL:", "CONNECT TUNNEL", "COULD NOT", "POLL ",
+    "EXCEEDED 30", "PROXY", "TIMEOUT", "TIMED OUT",
+    "LIBCURL", "SESSION", "SOCKET", "SSL", "NETWORK",
+)
 
-@app.get("/3ltz-status")
+def _is_infra(key: str) -> bool:
+    k = key.upper()
+    return any(p in k for p in _INFRA_KEYS)
+
+@app.get("/a3ltz-status")
 async def route_status():
-    return JSONResponse({
-        "ok": True, "api": "3ltz",
-        **_stats
-    })
+    with _stats_lock:
+        snap     = dict(_stats)
+        counters = dict(_response_counters)
 
+    total    = snap["total"]
+    charged  = snap["charged"]
+    approved = snap["approved"]
+    declined = snap["declined"]
+    errors   = snap["errors"]
+    active   = snap["active"]
+
+    def rate(n):
+        return round(n / total * 100, 2) if total > 0 else 0.0
+
+    # أكثر الردود تكراراً — بدون Error/infra
+    top_responses = sorted(
+        [{"msg": k, "count": v["count"], "category": v["category"]}
+         for k, v in counters.items() if not _is_infra(k)],
+        key=lambda x: x["count"], reverse=True
+    )[:20]
+
+    return JSONResponse({
+        "ok":            True,
+        "api":           "a3ltz",
+        "started":       snap["started"],
+        "active":        active,
+        "total":         total,
+        "charged":       charged,
+        "approved":      approved,
+        "declined":      declined,
+        "errors":        errors,
+        "charge_rate":   rate(charged),
+        "approve_rate":  rate(approved),
+        "decline_rate":  rate(declined),
+        "error_rate":    rate(errors),
+        "hit_rate":      rate(charged + approved),
+        "last_charged":  snap.get("last_charged"),
+        "last_approved": snap.get("last_approved"),
+        "last_declined": snap.get("last_declined"),
+        "top_responses": top_responses,
+    })
 
 @app.api_route("/a3ltz-check", methods=["GET", "POST"])
 async def route_check(
@@ -251,7 +327,6 @@ async def route_check(
     site:  Optional[str] = Query(None),
     proxy: Optional[str] = Query(None),
 ):
-    # ── فحص الذاكرة أولاً ─────────────────────────────────────
     if _is_memory_exceeded():
         return JSONResponse({"error": "Server is busy"}, status_code=503)
 
@@ -269,8 +344,9 @@ async def route_check(
     if not site:
         return JSONResponse({"error": "Missing site"}, status_code=400)
 
-    _stats["active"] += 1
-    _stats["total"]  += 1
+    with _stats_lock:
+        _stats["active"] += 1
+        _stats["total"]  += 1
     t0 = time.monotonic()
 
     try:
@@ -279,42 +355,63 @@ async def route_check(
             timeout=REQUEST_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        _stats["errors"] += 1
-        _stats["active"] -= 1
+        with _stats_lock:
+            _stats["errors"] += 1
+            _stats["active"] -= 1
         _log.info("%s|Timeout", cc)
+        # don't track timeout in response counters — proxy/infra noise
         return JSONResponse({
-            "Status":  "SiteError",
-            "Response": "Timeout",
-            "Price":   "-",
-            "Gateway": "3ltz",
-            "Card":    cc,
-            "site":    site,
-            "elapsed": round(time.monotonic() - t0, 2),
+            "Status":      "SiteError",
+            "Response":    "Timeout",
+            "Price":       "-",
+            "Gateway":     "Shopify",
+            "Card":        cc,
+            "site":        site,
+            "receipt_url": "",
+            "elapsed":     round(time.monotonic() - t0, 2),
         })
     except Exception as e:
-        _stats["errors"] += 1
-        _stats["active"] -= 1
-        _log.info("%s|%s", cc, str(e)[:80])
+        with _stats_lock:
+            _stats["errors"] += 1
+            _stats["active"] -= 1
+        err_str = str(e)[:150]
+        _log.info("%s|%s", cc, err_str[:80])
+        # don't track exception in response counters — proxy/infra noise
         return JSONResponse({
-            "Status":  "SiteError",
-            "Response": str(e)[:150],
-            "Price":   "-",
-            "Gateway": "3ltz",
-            "Card":    cc,
-            "site":    site,
-            "elapsed": round(time.monotonic() - t0, 2),
+            "Status":      "SiteError",
+            "Response":    err_str,
+            "Price":       "-",
+            "Gateway":     "Shopify",
+            "Card":        cc,
+            "site":        site,
+            "receipt_url": "",
+            "elapsed":     round(time.monotonic() - t0, 2),
         })
 
     elapsed     = round(time.monotonic() - t0, 2)
     card_status = result.get("status", "error")
+    result_str  = result.get("result", "")
 
-    _stats[{"charged": "charged", "approved": "approved",
-            "declined": "declined"}.get(card_status, "errors")] += 1
-    _stats["active"] -= 1
+    with _stats_lock:
+        stat_key = {"charged": "charged", "approved": "approved", "declined": "declined"}.get(card_status, "errors")
+        _stats[stat_key] += 1
+        _stats["active"] -= 1
+        now_ts = _ts_now()
+        if card_status == "charged":
+            _stats["last_charged"]  = now_ts
+        elif card_status == "approved":
+            _stats["last_approved"] = now_ts
+        elif card_status == "declined":
+            _stats["last_declined"] = now_ts
+        _persist_stats()
+
+    if card_status in ("charged", "approved", "declined"):
+        _track_response(result_str, card_status)
 
     if card_status in ("charged", "approved"):
         await _save_dump(cc, site, card_status,
-                         result.get("result", ""), result.get("amount", "0"))
+                         result_str, result.get("amount", "0"),
+                         result.get("currency", "USD"))
 
     bot_status = {
         "charged":  "Charged",
@@ -324,48 +421,21 @@ async def route_check(
 
     _result_str = result.get("result", "")
     if card_status == "charged":
-        _result_str = "ORDER_PAID"
+        _result_str = "ORDER_PLACED"
     elif card_status == "approved" and "3DS" in _result_str.upper():
         _result_str = "3DS_REQUIRED"
 
     return JSONResponse({
-        "Status":  bot_status,
-        "Response": _result_str,
-        "Price":   result.get("amount", "-"),
-        "Gateway": "3ltz",
-        "Card":    cc,
-        "site":    site,
-        "elapsed": elapsed,
+        "Status":      bot_status,
+        "Response":    _result_str,
+        "Price":       result.get("amount", "-"),
+        "Currency":    result.get("currency", "USD"),
+        "Gateway":     "Shopify",
+        "Card":        cc,
+        "site":        site,
+        "receipt_url": result.get("receipt_url", ""),
+        "elapsed":     elapsed,
     })
 
-
-# ══════════════════════════════════════════════════════════════
-#  Entry point
-# ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    import multiprocessing
-    # ✅ worker واحد لكل CPU — async يعالج كل التزامن داخلياً
-    cpu_count = multiprocessing.cpu_count()
-    workers   = max(1, cpu_count)
-
-    print("━" * 50)
-    print("  3ltz Checker API — TURBO MODE")
-    print(f"  Port         : {PORT}")
-    print(f"  Workers      : {workers}  (1 per CPU)")
-    print(f"  Endpoint     : /3ltz-xK9qPm2r")
-    print(f"  Status       : /3ltz-status")
-    print(f"  Timeout      : {REQUEST_TIMEOUT}s")
-    print("━" * 50)
-    print("━" * 50)
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=PORT,
-        loop="uvloop",          # ✅ أسرع event loop
-        workers=workers,        # ✅ 1 لكل CPU فقط
-        access_log=False,
-        backlog=4096,
-        timeout_keep_alive=55,
-        limit_max_requests=None,
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
