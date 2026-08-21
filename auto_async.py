@@ -126,27 +126,28 @@ class AsyncTLSClient:
 
 # ── Step 0: cheapest product ──────────────────────────────────────────
 
-async def _fetch_cheapest_page(client: AsyncTLSClient, shop_url: str) -> list:
-    """جلب المنتج الأرخص مباشرة — طلب واحد فقط."""
-    try:
-        resp = await client.get(
-            f"{shop_url}/products.json?sort_by=price-ascending&limit=1"
-        )
-    except Exception as e:
-        raise Exception(f"products.json connection error: {e}")
-    if resp.status_code == 429:
-        raise Exception("products.json 429 rate limit")
-    if resp.status_code == 503:
-        raise Exception("products.json 503")
-    if resp.status_code != 200:
-        body = resp.text[:200].lower()
-        if "cloudflare" in body or "1003" in body:
-            raise Exception("cloudflare block")
-        raise Exception(f"products.json returned {resp.status_code}")
-    try:
-        return resp.json().get("products", [])
-    except Exception:
-        raise Exception("products.json invalid JSON")
+async def _fetch_products_parallel(client: AsyncTLSClient, shop_url: str, total_needed: int = 350) -> list:
+    """سحب بيانات 350 منتج بالتوازي للحصول على أرخص سعر ممكن."""
+    all_products = []
+    page_limit = 50 # Shopify products.json max limit is usually 50 or 250
+    pages_to_fetch = (total_needed + page_limit - 1) // page_limit
+    
+    async def _fetch_page(page):
+        try:
+            resp = await client.get(
+                f"{shop_url}/products.json?limit={page_limit}&page={page}&sort_by=price-ascending"
+            )
+            if resp.status_code == 200:
+                return resp.json().get("products", [])
+        except Exception:
+            pass
+        return []
+
+    tasks = [asyncio.create_task(_fetch_page(p)) for p in range(1, pages_to_fetch + 1)]
+    results = await asyncio.gather(*tasks)
+    for res in results:
+        all_products.extend(res)
+    return all_products
 
 
 def _best_entry(products: list, min_price: float) -> tuple | None:
@@ -188,7 +189,7 @@ async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
         if cached and now - cached[-1] < _CACHE_TTL:
             return cached[:-1]
 
-    products = await _fetch_cheapest_page(client, shop_url)
+    products = await _fetch_products_parallel(client, shop_url, total_needed=350)
     best = _best_entry(products, min_price)
     if best:
         with _product_cache_lock:
@@ -1133,12 +1134,13 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error  = e
             return result
 
-        # Step 11 — poll for receipt
+        # Step 11 — Deep Inspection Polling
         poll_delay_re = re.compile(r'"pollDelay"\s*:\s*(\d+)')
         type_name_re  = re.compile(
             r'"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"')
 
-        for poll_num in range(1, 31):
+        # زيادة عدد المحاولات لضمان الدقة (Deep Inspection)
+        for poll_num in range(1, 60): 
             try:
                 _, poll_body = await send_poll_for_receipt(
                     client, shop_url, checkout_url, checkout_token, session_token,
@@ -1152,11 +1154,23 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
 
                 result.status_code = extract_receipt_status_code(poll_body, receipt_type)
 
-                if receipt_type in ("SuccessfulReceipt", "ProcessedReceipt"):
-                    result.status      = CheckStatus.CHARGED
-                    result.status_code = "ORDER_PLACED"
-                    result.receipt_url = checkout_url + "/thank_you"
+                # كشف الخصم الوهمي (Dead Gateway)
+                if "Your payment is being processed" in poll_body or "Confirmation #PZRU3FFZD" in poll_body:
+                    result.status      = CheckStatus.DECLINED
+                    result.status_code = "DEAD_GATEWAY"
                     return result
+
+                if receipt_type in ("SuccessfulReceipt", "ProcessedReceipt"):
+                    # تأكيد إضافي للدقة
+                    if "thank_you" in poll_body or "Confirmation" in poll_body:
+                        result.status      = CheckStatus.CHARGED
+                        result.status_code = "ORDER_PLACED"
+                        result.receipt_url = checkout_url + "/thank_you"
+                        return result
+                    else:
+                        # حالة غير واضحة، استمر في الفحص
+                        await asyncio.sleep(1.0)
+                        continue
 
                 if receipt_type == "ActionRequiredReceipt":
                     result.status      = CheckStatus.APPROVED
@@ -1167,48 +1181,49 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                     error_re   = re.compile(r'"code"\s*:\s*"([^"]+)"')
                     em         = error_re.search(poll_body)
                     error_code = em.group(1) if em else ""
-                    if "CAPTCHA" in error_code:
-                        error_code = "CPATCHA_REQUIRED"
+                    
+                    if "CAPTCHA" in (error_code or "").upper():
+                        result.status      = CheckStatus.DECLINED
+                        result.status_code = "CPATCHA_REQUIRED"
+                        return result
+                        
                     if error_code == "INSUFFICIENT_FUNDS":
                         result.status      = CheckStatus.APPROVED
                         result.status_code = "INSUFFICIENT_FUNDS"
-                    elif error_code in ("CARD_DECLINED", "GENERIC_ERROR"):
+                    elif error_code in ("CARD_DECLINED", "GENERIC_ERROR", "FRAUD"):
                         result.status      = CheckStatus.DECLINED
-                        result.status_code = "CARD_DECLINED"
-                        result.error       = Exception("CARD_DECLINED")
-                    elif error_code == "01003":
-                        # payment processor rejection — may be proxy/network, treat as declined but retryable
-                        result.status      = CheckStatus.DECLINED
-                        result.status_code = "CARD_DECLINED"
-                        result.error       = Exception("CARD_DECLINED")
-                        result.retryable   = True
+                        result.status_code = error_code or "CARD_DECLINED"
                     else:
-                        if "InventoryReservationFailure" in poll_body:
-                            result.status    = CheckStatus.ERROR
-                            result.retryable = True
-                        else:
-                            result.status = CheckStatus.DECLINED
-                            result.error  = Exception(error_code)
+                        result.status = CheckStatus.DECLINED
+                        result.status_code = error_code or "DECLINED"
                     return result
 
-                delay = 500
+                # إذا استمرت المعالجة لفترة طويلة جداً، نعتبرها Dead Gateway
+                if poll_num > 45 and receipt_type == "ProcessingReceipt":
+                    result.status      = CheckStatus.DECLINED
+                    result.status_code = "DEAD_GATEWAY"
+                    return result
+
+                delay = 800 # زيادة التأخير قليلاً لزيادة الدقة وتقليل الضغط
                 m2 = poll_delay_re.search(poll_body)
                 if m2:
                     try:
                         d = int(m2.group(1))
-                        if d > 0:
-                            delay = d
-                    except ValueError:
-                        pass
-                await asyncio.sleep(min(delay, 150) / 1000.0)
+                        if d > 0: delay = max(d, 800)
+                    except Exception: pass
+                await asyncio.sleep(delay / 1000.0)
 
             except Exception as e:
+                # محاولة الإنقاذ في حال حدوث خطأ عابر
+                if poll_num < 5:
+                    await asyncio.sleep(1.0)
+                    continue
                 result.status = CheckStatus.ERROR
                 result.error  = Exception(f"poll {poll_num} failed: {e}")
                 return result
 
         result.status = CheckStatus.ERROR
-        result.error  = Exception("exceeded 30 poll attempts")
+        result.error  = Exception("exceeded 60 deep inspection poll attempts")
         return result
 
     finally:
