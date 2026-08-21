@@ -717,20 +717,34 @@ def extract_receipt_status_code(poll_body: str, receipt_type: str) -> str:
         return "ORDER_PLACED"
     if receipt_type == "ProcessingReceipt":
         return "PROCESSING"
-    # ابحث عن "code" المرتبط بـ localizedMessage فقط (نفس نمط check_proposal_errors)
-    # هذا يتجنب مسك currency code أو country code اللي تجي قبل error code
-    match = re.search(
-        r'"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"[^"]*"',
-        poll_body)
-    if match:
-        code = match.group(1)
-        if "CAPTCHA" in code:
-            return "CPATCHA_REQUIRED"
-        return code
-    if "CAPTCHA" in poll_body:
+    
+    # Improved extraction: look for code near localizedMessage or nonLocalizedMessage
+    patterns = [
+        r'"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"',
+        r'"code"\s*:\s*"([^"]+)"\s*,\s*"nonLocalizedMessage"',
+        r'"code"\s*:\s*"([^"]+)"',
+    ]
+    
+    for p in patterns:
+        match = re.search(p, poll_body)
+        if match:
+            code = match.group(1)
+            # Filter out common non-error codes if using the loose pattern
+            if p == patterns[-1] and code in ("USD", "CAD", "EUR", "GBP", "US", "CA", "FR", "GB"):
+                continue
+            if "CAPTCHA" in code.upper():
+                return "CPATCHA_REQUIRED"
+            return code
+            
+    if "CAPTCHA" in poll_body.upper():
         return "CPATCHA_REQUIRED"
+        
     if receipt_type == "FailedReceipt":
-        return "FAILED"
+        # Final fallback: try to find ANY uppercase error-like string in the body
+        fallback_match = re.search(r'"([A-Z_]{5,})"', poll_body)
+        if fallback_match:
+            return fallback_match.group(1)
+        return "CARD_DECLINED"
     return "UNKNOWN"
 
 def detect_shipping_restriction(proposal_body: str) -> bool:

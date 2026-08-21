@@ -1255,26 +1255,24 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                     return result
 
                 if receipt_type == "FailedReceipt":
-                    # Improved error extraction to avoid generic "FAILED"
-                    error_re   = re.compile(
-                        r'"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"([^"]*)"')
-                    em         = error_re.search(poll_body)
-                    error_code = em.group(1) if em else ""
-                    error_msg  = em.group(2) if em else ""
+                    # Improved robust error extraction
+                    error_code = extract_receipt_status_code(poll_body, receipt_type)
                     
-                    if "CAPTCHA" in error_code or "CAPTCHA" in error_msg:
-                        error_code = "CPATCHA_REQUIRED"
+                    # Also try to get the message for logging
+                    msg_match = re.search(r'"localizedMessage"\s*:\s*"([^"]*)"', poll_body)
+                    error_msg = msg_match.group(1) if msg_match else ""
                     
-                    # Return the specific error instead of collapsing to CARD_DECLINED
-                    result.status_code = error_code or "FAILED"
+                    # Return the specific error
+                    result.status_code = error_code
                     
                     if error_code == "INSUFFICIENT_FUNDS":
                         result.status = CheckStatus.APPROVED
                     elif error_code in ("CARD_DECLINED", "GENERIC_ERROR", "01003"):
                         result.status = CheckStatus.DECLINED
-                        # If it's a generic processor error, allow one retry
                         if error_code in ("GENERIC_ERROR", "01003"):
                             result.retryable = True
+                    elif error_code == "CPATCHA_REQUIRED":
+                        result.status = CheckStatus.DECLINED
                     elif "InventoryReservationFailure" in poll_body:
                         result.status    = CheckStatus.ERROR
                         result.retryable = True
