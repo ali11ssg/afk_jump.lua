@@ -244,7 +244,7 @@ async def route_status():
     })
 
 
-@app.api_route("/3ltz-xK9qPm2r", methods=["GET", "POST"])
+@app.api_route("/a3ltz-check", methods=["GET", "POST"])
 async def route_check(
     request: Request,
     cc:    Optional[str] = Query(None),
