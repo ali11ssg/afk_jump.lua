@@ -1203,7 +1203,8 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             r'"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"')
         _poll_start = asyncio.get_event_loop().time()
 
-        for poll_num in range(1, 61):
+        # Reduced poll attempts to 30 (from 60) for speed
+        for poll_num in range(1, 31):
             try:
                 _, poll_body = await send_poll_for_receipt(
                     client, shop_url, checkout_url, checkout_token, session_token,
@@ -1254,33 +1255,33 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                     return result
 
                 if receipt_type == "FailedReceipt":
-                    # استخدم نمط localizedMessage لتجنب مسك currency/country codes
+                    # Improved error extraction to avoid generic "FAILED"
                     error_re   = re.compile(
-                        r'"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"[^"]*"')
+                        r'"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"([^"]*)"')
                     em         = error_re.search(poll_body)
                     error_code = em.group(1) if em else ""
-                    if "CAPTCHA" in error_code:
+                    error_msg  = em.group(2) if em else ""
+                    
+                    if "CAPTCHA" in error_code or "CAPTCHA" in error_msg:
                         error_code = "CPATCHA_REQUIRED"
+                    
+                    # Return the specific error instead of collapsing to CARD_DECLINED
+                    result.status_code = error_code or "FAILED"
+                    
                     if error_code == "INSUFFICIENT_FUNDS":
-                        result.status      = CheckStatus.APPROVED
-                        result.status_code = "INSUFFICIENT_FUNDS"
-                    elif error_code in ("CARD_DECLINED", "GENERIC_ERROR"):
-                        result.status      = CheckStatus.DECLINED
-                        result.status_code = "CARD_DECLINED"
-                        result.error       = Exception("CARD_DECLINED")
-                    elif error_code == "01003":
-                        # payment processor rejection — may be proxy/network, treat as declined but retryable
-                        result.status      = CheckStatus.DECLINED
-                        result.status_code = "CARD_DECLINED"
-                        result.error       = Exception("CARD_DECLINED")
-                        result.retryable   = True
-                    else:
-                        if "InventoryReservationFailure" in poll_body:
-                            result.status    = CheckStatus.ERROR
+                        result.status = CheckStatus.APPROVED
+                    elif error_code in ("CARD_DECLINED", "GENERIC_ERROR", "01003"):
+                        result.status = CheckStatus.DECLINED
+                        # If it's a generic processor error, allow one retry
+                        if error_code in ("GENERIC_ERROR", "01003"):
                             result.retryable = True
-                        else:
-                            result.status = CheckStatus.DECLINED
-                            result.error  = Exception(error_code)
+                    elif "InventoryReservationFailure" in poll_body:
+                        result.status    = CheckStatus.ERROR
+                        result.retryable = True
+                    else:
+                        result.status = CheckStatus.DECLINED
+                    
+                    result.error = Exception(f"{error_code}: {error_msg}" if error_msg else error_code)
                     return result
 
                 delay = 500
@@ -1292,11 +1293,12 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                             delay = d
                     except ValueError:
                         pass
-                await asyncio.sleep(min(delay, 2000) / 1000.0)
+                # Reduced max sleep to 1.5s (from 2s) and faster base polling
+                await asyncio.sleep(min(delay, 1500) / 1000.0)
 
-                if asyncio.get_event_loop().time() - _poll_start > 90:
+                if asyncio.get_event_loop().time() - _poll_start > 45:
                     result.status = CheckStatus.ERROR
-                    result.error  = Exception("poll timeout: exceeded 90s")
+                    result.error  = Exception("poll timeout: exceeded 45s")
                     return result
 
             except Exception as e:
